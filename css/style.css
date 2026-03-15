@@ -9,6 +9,9 @@ html, body {
     height: 100%;
     overflow: hidden;
     background-color: #000000;
+    /* Prevent text selection on double-click etc */
+    user-select: none;
+    -webkit-user-select: none;
 }
 
 canvas#game {
@@ -17,4 +20,9 @@ canvas#game {
     image-rendering: -moz-crisp-edges;
     -ms-interpolation-mode: nearest-neighbor;
     display: block;
+}
+
+/* Hide cursor during gameplay for cleaner look */
+body.playing {
+    cursor: none;
 }

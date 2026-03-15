@@ -1,4 +1,6 @@
 // player.js — Player entity with state machine
+// Adapted for horizontal net. Side 0 = near (bottom), Side 1 = far (top).
+// Players face UP (toward net) by default on near side, DOWN on far side.
 
 import { COURT } from './court.js';
 
@@ -34,37 +36,53 @@ export class Player {
     constructor(teamIndex, playerIndex, side, isHuman, stats) {
         this.teamIndex = teamIndex;
         this.playerIndex = playerIndex;
-        this.side = side;           // 0 = left, 1 = right
+        this.side = side;           // 0 = near (bottom), 1 = far (top)
         this.isHuman = isHuman;
         this.stats = stats || { speed: 5, power: 5, technique: 5, defense: 5 };
 
-        // Position
+        // Position on court
         this.x = 0;
         this.y = 0;
-        this.z = 0;                 // height above ground (for jumps)
+        this.z = 0;                 // height above ground
         this.vz = 0;                // vertical velocity
 
         // State
         this.state = PLAYER_STATES.IDLE;
         this.stateTimer = 0;
         this.animFrame = 0;
-        this.facingRight = side === 0; // Left team faces right, right team faces left
+        // Near side players face up (toward net), far side face down
+        this.facingRight = true;
+        this.facingUp = side === 0;  // near side looks up
 
-        // Width/height for collision
-        this.width = 16;
-        this.height = 24;
+        // Width/height for collision (sprite bounds)
+        this.width = 12;
+        this.height = 18;
 
         // Dive velocity
         this.diveVx = 0;
         this.diveVy = 0;
 
-        // Track if this player just hit the ball (to prevent double-hits)
+        // Hit tracking
         this.justHitBall = false;
         this.hitCooldown = 0;
+
+        // Team appearance (set externally)
+        this.color1 = '#3355DD';
+        this.color2 = '#DD3333';
+        this.skin = '#FFCC88';
+        this.hairColor = '#442200';
+        this.hairStyle = 'short';
+
+        // Power meter for special spikes (0-100)
+        this.powerMeter = 0;
+
+        // Visual indicator
+        this.indicator = null; // 'ready', 'target', or null
+        this.indicatorTimer = 0;
     }
 
     get speed() {
-        return 1.0 + (this.stats.speed * 0.1);
+        return 1.0 + (this.stats.speed * 0.12);
     }
 
     get screenX() {
@@ -72,40 +90,41 @@ export class Player {
     }
 
     get screenY() {
-        return this.y - this.z;
+        return this.y - this.z * 0.7;
     }
 
     setDefaultPosition(side, isServer, playerIdx) {
         if (side === 0) {
-            // Left team
+            // Near side (bottom half, y > 140)
             if (isServer) {
-                this.x = 50;
-                this.y = 180;
+                this.x = 110;
+                this.y = 200;
             } else if (playerIdx === 0) {
-                this.x = 60;
-                this.y = 140;
-            } else {
                 this.x = 90;
-                this.y = 160;
+                this.y = 170;
+            } else {
+                this.x = 150;
+                this.y = 175;
             }
         } else {
-            // Right team
+            // Far side (top half, y < 140)
             if (isServer) {
-                this.x = 196;
-                this.y = 180;
+                this.x = 146;
+                this.y = 90;
             } else if (playerIdx === 0) {
-                this.x = 196;
-                this.y = 140;
+                this.x = 110;
+                this.y = 108;
             } else {
-                this.x = 166;
-                this.y = 160;
+                this.x = 160;
+                this.y = 112;
             }
         }
         this.z = 0;
         this.vz = 0;
         this.state = PLAYER_STATES.IDLE;
         this.stateTimer = 0;
-        this.facingRight = side === 0;
+        this.facingUp = side === 0;
+        this.facingRight = true;
     }
 
     setState(newState) {
@@ -116,7 +135,6 @@ export class Player {
     }
 
     isActionable() {
-        // Can the player perform a new action?
         return this.state === PLAYER_STATES.IDLE ||
                this.state === PLAYER_STATES.RUNNING;
     }
@@ -131,7 +149,6 @@ export class Player {
         if (!this.isActionable() && this.state !== PLAYER_STATES.JUMPING &&
             this.state !== PLAYER_STATES.SPIKING) return;
 
-        // During jump/spike, allow slight air control
         let spd = this.speed;
         if (this.isInAir()) {
             spd *= 0.3;
@@ -142,20 +159,20 @@ export class Player {
         let newX = this.x + dx * spd;
         let newY = this.y + dy * spd;
 
-        // Boundary constraints
+        // Boundary constraints - can't cross the net
+        newX = Math.max(COURT.LEFT + 2, Math.min(COURT.RIGHT - 14, newX));
         if (this.side === 0) {
-            // Left side: can't cross net
-            newX = Math.max(COURT.LEFT, Math.min(COURT.LEFT_SIDE_MAX, newX));
+            // Near side: stay below net
+            newY = Math.max(COURT.NET_Y + 2, Math.min(COURT.BOTTOM - 4, newY));
         } else {
-            // Right side: can't cross net
-            newX = Math.max(COURT.RIGHT_SIDE_MIN, Math.min(COURT.RIGHT, newX));
+            // Far side: stay above net
+            newY = Math.max(COURT.TOP + 2, Math.min(COURT.NET_Y - 2, newY));
         }
-        newY = Math.max(COURT.TOP, Math.min(COURT.BOTTOM - 4, newY));
 
         this.x = newX;
         this.y = newY;
 
-        // Update facing direction based on movement
+        // Update facing direction
         if (dx !== 0) {
             this.facingRight = dx > 0;
         }
@@ -182,19 +199,36 @@ export class Player {
         if (this.state !== PLAYER_STATES.JUMPING && !this.isActionable()) return;
         this.setState(PLAYER_STATES.SPIKING);
 
-        // Hit ball hard toward opponent's side
         const power = this.stats.power;
         const technique = this.stats.technique;
+        const isPower = this.powerMeter >= 100;
 
+        // Spike goes OVER the net toward opponent's side
+        // Side 0 spikes upward (vy < 0), side 1 spikes downward (vy > 0)
         if (this.side === 0) {
-            ball.vx = 2.5 + power * 0.3;
+            ball.vy = -(2.5 + power * 0.25);
         } else {
-            ball.vx = -(2.5 + power * 0.3);
+            ball.vy = (2.5 + power * 0.25);
         }
 
-        // Slight y spread based on technique (less spread = better)
-        ball.vy = (Math.random() - 0.5) * (2 - technique * 0.15);
-        ball.vz = -1.5 - power * 0.1;
+        // Slight x spread based on technique
+        ball.vx = (Math.random() - 0.5) * (2 - technique * 0.12);
+        // Ball slams down hard
+        ball.vz = -2.5 - power * 0.15;
+
+        if (isPower) {
+            // Power spike: faster, screen flash, trail
+            ball.vy *= 1.4;
+            ball.vz *= 1.3;
+            ball.isPowerSpike = true;
+            ball.spikeTrail = true;
+            ball.screenFlash = 3;
+            this.powerMeter = 0;
+        } else {
+            ball.spikeTrail = true;
+            ball.screenFlash = 2;
+        }
+
         ball.active = true;
         ball.lastTeam = this.side;
         ball.hitCooldown = 10;
@@ -212,43 +246,53 @@ export class Player {
         const dy = partnerY - ball.y;
         const dist = Math.sqrt(dx * dx + dy * dy) || 1;
 
-        ball.vx = (dx / dist) * 1.2;
-        ball.vy = (dy / dist) * 0.5;
-        ball.vz = 3.0;
+        ball.vx = (dx / dist) * 1.0;
+        ball.vy = (dy / dist) * 0.8;
+        ball.vz = 3.5;  // high pop
         ball.active = true;
         ball.lastTeam = this.side;
         ball.hitCooldown = 8;
+        ball.spikeTrail = false;
+        ball.isPowerSpike = false;
 
         this.justHitBall = true;
         this.hitCooldown = 10;
+
+        // Build power meter on successful receives
+        this.powerMeter = Math.min(100, this.powerMeter + 15);
     }
 
     set(ball) {
         if (!this.isActionable() && this.state !== PLAYER_STATES.JUMPING) return;
         this.setState(PLAYER_STATES.SETTING);
 
-        // Loft ball to net area on their side
-        let targetX;
+        // Loft ball high near the net for spiking
+        let targetX = this.x + (this.facingRight ? 15 : -15);
+        let targetY;
         if (this.side === 0) {
-            targetX = COURT.NET_X - 15; // Near net on left side
+            targetY = COURT.NET_Y + 8;  // just past the net on our side
         } else {
-            targetX = COURT.NET_X + 15; // Near net on right side
+            targetY = COURT.NET_Y - 8;
         }
-        const targetY = 150; // Center of court depth
 
         const dx = targetX - ball.x;
         const dy = targetY - ball.y;
         const dist = Math.sqrt(dx * dx + dy * dy) || 1;
 
-        ball.vx = (dx / dist) * 1.5;
-        ball.vy = (dy / dist) * 0.4;
-        ball.vz = 3.5;
+        ball.vx = (dx / dist) * 1.2;
+        ball.vy = (dy / dist) * 0.6;
+        ball.vz = 4.0;  // high loft
         ball.active = true;
         ball.lastTeam = this.side;
         ball.hitCooldown = 8;
+        ball.spikeTrail = false;
+        ball.isPowerSpike = false;
 
         this.justHitBall = true;
         this.hitCooldown = 10;
+
+        // Build power meter on sets
+        this.powerMeter = Math.min(100, this.powerMeter + 10);
     }
 
     dive() {
@@ -256,8 +300,9 @@ export class Player {
         this.setState(PLAYER_STATES.DIVING);
 
         // Lunge in facing direction
-        this.diveVx = this.facingRight ? 3.0 : -3.0;
-        this.diveVy = 0;
+        this.diveVx = this.facingRight ? 2.8 : -2.8;
+        // Also dive toward net or ball direction
+        this.diveVy = this.side === 0 ? -1.5 : 1.5;
     }
 
     block() {
@@ -269,20 +314,22 @@ export class Player {
     serve(ball) {
         this.setState(PLAYER_STATES.SERVING);
 
-        // Hit ball toward opponent's side
         const power = this.stats.power;
+        // Serve goes toward opponent's side
         if (this.side === 0) {
-            ball.vx = 1.5 + power * 0.15;
+            ball.vy = -(1.5 + power * 0.12);
         } else {
-            ball.vx = -(1.5 + power * 0.15);
+            ball.vy = (1.5 + power * 0.12);
         }
-        ball.vy = (Math.random() - 0.5) * 0.5;
-        ball.vz = 1.8;
+        ball.vx = (Math.random() - 0.5) * 0.8;
+        ball.vz = 2.0;
         ball.active = true;
         ball.landed = false;
         ball.lastTeam = this.side;
         ball.touchCount = 0;
         ball.hitCooldown = 15;
+        ball.spikeTrail = false;
+        ball.isPowerSpike = false;
 
         this.justHitBall = true;
         this.hitCooldown = 15;
@@ -290,7 +337,7 @@ export class Player {
 
     update() {
         this.stateTimer++;
-        this.animFrame += 0.1;
+        this.animFrame += 0.12;
 
         // Hit cooldown
         if (this.hitCooldown > 0) {
@@ -300,14 +347,21 @@ export class Player {
             }
         }
 
-        // Handle jump physics
+        // Indicator timer
+        if (this.indicatorTimer > 0) {
+            this.indicatorTimer--;
+            if (this.indicatorTimer === 0) {
+                this.indicator = null;
+            }
+        }
+
+        // Jump physics
         if (this.z > 0 || this.vz > 0) {
             this.vz -= 0.15;
             this.z += this.vz;
             if (this.z <= 0) {
                 this.z = 0;
                 this.vz = 0;
-                // Land from jump
                 if (this.state === PLAYER_STATES.JUMPING ||
                     this.state === PLAYER_STATES.SPIKING ||
                     this.state === PLAYER_STATES.BLOCKING) {
@@ -316,18 +370,18 @@ export class Player {
             }
         }
 
-        // Handle dive movement
+        // Dive movement
         if (this.state === PLAYER_STATES.DIVING) {
             if (this.stateTimer < 10) {
                 let newX = this.x + this.diveVx;
                 let newY = this.y + this.diveVy;
-                // Boundary check
+                // Clamp to boundaries
+                newX = Math.max(COURT.LEFT + 2, Math.min(COURT.RIGHT - 14, newX));
                 if (this.side === 0) {
-                    newX = Math.max(COURT.LEFT, Math.min(COURT.LEFT_SIDE_MAX, newX));
+                    newY = Math.max(COURT.NET_Y + 2, Math.min(COURT.BOTTOM - 4, newY));
                 } else {
-                    newX = Math.max(COURT.RIGHT_SIDE_MIN, Math.min(COURT.RIGHT, newX));
+                    newY = Math.max(COURT.TOP + 2, Math.min(COURT.NET_Y - 2, newY));
                 }
-                newY = Math.max(COURT.TOP, Math.min(COURT.BOTTOM - 4, newY));
                 this.x = newX;
                 this.y = newY;
             }
@@ -340,34 +394,48 @@ export class Player {
         }
     }
 
-    // Get vertical reach (for collision with ball)
+    // Vertical reach for collision
     getReach() {
-        let reach = 24; // standing reach above feet
+        let reach = 22;
         if (this.state === PLAYER_STATES.JUMPING ||
             this.state === PLAYER_STATES.SPIKING) {
-            reach = 32 + this.z;
+            reach = 30 + this.z;
         }
         if (this.state === PLAYER_STATES.BLOCKING) {
-            reach = 36 + this.z;
+            reach = 34 + this.z;
         }
         return reach;
     }
 
-    // Get the hitbox for ball collision
+    // Hitbox for ball collision
     getHitbox() {
         let w = this.width;
         let h = this.height;
         if (this.state === PLAYER_STATES.DIVING) {
-            w = 24;
-            h = 12;
+            w = 20;
+            h = 10;
         }
         return {
             x: this.x - 2,
-            y: this.y - 4,
+            y: this.y - 6,
             w: w + 4,
-            h: h + 4,
+            h: h + 6,
             zBottom: this.z,
             zTop: this.z + this.getReach()
         };
+    }
+
+    // Whether player is near the net
+    isNearNet() {
+        if (this.side === 0) {
+            return this.y < COURT.NET_Y + 25;
+        } else {
+            return this.y > COURT.NET_Y - 25;
+        }
+    }
+
+    showIndicator(type, duration = 30) {
+        this.indicator = type;
+        this.indicatorTimer = duration;
     }
 }

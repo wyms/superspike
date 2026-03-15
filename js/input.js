@@ -1,4 +1,5 @@
 // input.js — Keyboard input manager
+// Supports both arrow keys (P1) and WASD (P2, for future 2-player)
 
 const keysDown = new Set();
 const keysJustPressed = new Set();
@@ -24,7 +25,6 @@ function init() {
         keysJustReleased.add(e.code);
     });
 
-    // Clear state if window loses focus
     window.addEventListener('blur', () => {
         keysDown.clear();
     });
@@ -47,7 +47,7 @@ export function clearFrame() {
     keysJustReleased.clear();
 }
 
-// P1 movement helpers
+// P1 movement (arrows)
 export function getP1Direction() {
     let dx = 0, dy = 0;
     if (isDown('ArrowLeft')) dx -= 1;
@@ -57,7 +57,7 @@ export function getP1Direction() {
     return { dx, dy };
 }
 
-// P2 movement helpers
+// P2 movement (WASD, for future use)
 export function getP2Direction() {
     let dx = 0, dy = 0;
     if (isDown('KeyA')) dx -= 1;

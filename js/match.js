@@ -1,4 +1,6 @@
 // match.js — Match state management
+// Updated for horizontal net: 'near' = side 0 (bottom), 'far' = side 1 (top)
+// Supports tournament modes: exercise, circuit, world cup
 
 export const RALLY_STATES = {
     READY_TO_SERVE: 'READY_TO_SERVE',
@@ -11,13 +13,13 @@ export const RALLY_STATES = {
 
 export class Match {
     constructor() {
-        this.scoreLeft = 0;
-        this.scoreRight = 0;
-        this.servingTeam = 0;         // 0 = left, 1 = right
-        this.servingPlayer = 0;       // which player on the serving team
+        this.scoreNear = 0;      // player's team (side 0)
+        this.scoreFar = 0;       // opponent team (side 1)
+        this.servingTeam = 0;    // 0 = near, 1 = far
+        this.servingPlayer = 0;
         this.rallyState = RALLY_STATES.READY_TO_SERVE;
-        this.touchCount = 0;          // touches on current side
-        this.currentSide = -1;        // which side currently has touches (0/1)
+        this.touchCount = 0;
+        this.currentSide = -1;
         this.stateTimer = 0;
         this.pointDelay = 0;
         this.lastPointWinner = -1;
@@ -25,22 +27,27 @@ export class Match {
         this.matchPointFlash = 0;
 
         // Teams
-        this.leftTeamName = '';
-        this.rightTeamName = '';
-        this.leftTeamIndex = 0;
-        this.rightTeamIndex = 1;
+        this.nearTeamName = '';
+        this.farTeamName = '';
+        this.nearTeamIndex = 0;
+        this.farTeamIndex = 1;
 
-        this.winner = -1;             // -1 = no winner yet
+        this.winner = -1;
         this.winScore = 15;
         this.maxScore = 21;
 
         this.message = '';
         this.messageTimer = 0;
+
+        // Tournament tracking
+        this.gameMode = 0;         // 0=exercise, 1=circuit, 2=world cup
+        this.tournamentRound = 0;  // current round in tournament
+        this.tournamentWins = 0;   // wins so far
     }
 
     reset() {
-        this.scoreLeft = 0;
-        this.scoreRight = 0;
+        this.scoreNear = 0;
+        this.scoreFar = 0;
         this.servingTeam = 0;
         this.servingPlayer = 0;
         this.rallyState = RALLY_STATES.READY_TO_SERVE;
@@ -74,10 +81,9 @@ export class Match {
         this.messageTimer = duration;
     }
 
-    // Called when ball is touched by a player on a given side
+    // Register a touch on a given side
     registerTouch(side) {
         if (side !== this.currentSide) {
-            // Ball switched sides
             this.currentSide = side;
             this.touchCount = 1;
         } else {
@@ -91,29 +97,24 @@ export class Match {
         return false;
     }
 
-    // Determine who scores based on ball landing
+    // Handle ball landing
     handleBallLanded(landResult) {
-        // landResult: 'left', 'right', 'out-left', 'out-right', 'net', or null
         if (!landResult) return false;
 
         switch (landResult) {
-            case 'left':
-                // Ball landed on left side — right team scores
+            case 'near':
+                // Ball landed on near side — far team scores
                 return this.scorePoint(1);
-            case 'right':
-                // Ball landed on right side — left team scores
+            case 'far':
+                // Ball landed on far side — near team scores
                 return this.scorePoint(0);
-            case 'out-left':
-                // Ball went out on left side — depends on last touch
-                // If last touch was left team, right scores (they hit it out)
-                // If last touch was right team, left scores (opponent hit it out)
-                // Actually: out-left means ball is out of bounds on left side
-                // The team that last touched it is responsible
+            case 'out-near':
+                // Out of bounds on near side - last toucher's fault
                 return this.scorePoint(this.currentSide === 0 ? 1 : 0);
-            case 'out-right':
+            case 'out-far':
+                // Out of bounds on far side
                 return this.scorePoint(this.currentSide === 1 ? 0 : 1);
             case 'net':
-                // Hit the net — point for the team that DIDN'T hit it
                 return this.scorePoint(this.currentSide === 0 ? 1 : 0);
             default:
                 return false;
@@ -121,57 +122,54 @@ export class Match {
     }
 
     handleNetHit(lastTouchSide) {
-        // Ball hit the net — point for the opposing team
         return this.scorePoint(lastTouchSide === 0 ? 1 : 0);
     }
 
     scorePoint(winningSide) {
         if (winningSide === 0) {
-            this.scoreLeft++;
+            this.scoreNear++;
         } else {
-            this.scoreRight++;
+            this.scoreFar++;
         }
 
         this.lastPointWinner = winningSide;
         this.rallyState = RALLY_STATES.POINT_SCORED;
         this.stateTimer = 0;
-        this.pointDelay = 90; // frames before next serve
+        this.pointDelay = 90;
 
-        // Update serving team
+        // Serving goes to winner
         this.servingTeam = winningSide;
 
-        // Check for match point
+        // Check match point
         if (this.isMatchPoint()) {
             this.matchPointFlash = 120;
             this.setMessage('MATCH POINT!', 90);
         }
 
-        // Check for match over
+        // Check match over
         if (this.isMatchOver()) {
             this.winner = winningSide;
             this.rallyState = RALLY_STATES.MATCH_OVER;
-            this.setMessage(winningSide === 0 ? this.leftTeamName + ' WINS!' :
-                           this.rightTeamName + ' WINS!', 300);
+            const winName = winningSide === 0 ? this.nearTeamName : this.farTeamName;
+            this.setMessage('GAME SET!', 300);
             return true;
         }
 
-        this.setMessage(winningSide === 0 ? this.leftTeamName + ' SCORES!' :
-                       this.rightTeamName + ' SCORES!', 60);
+        const scorerName = winningSide === 0 ? this.nearTeamName : this.farTeamName;
+        this.setMessage('POINT!', 50);
         return false;
     }
 
     isMatchPoint() {
-        // Check if either team is one point from winning
-        return (this.scoreLeft >= this.winScore - 1 && this.scoreLeft > this.scoreRight) ||
-               (this.scoreRight >= this.winScore - 1 && this.scoreRight > this.scoreLeft);
+        return (this.scoreNear >= this.winScore - 1 && this.scoreNear > this.scoreFar) ||
+               (this.scoreFar >= this.winScore - 1 && this.scoreFar > this.scoreNear);
     }
 
     isMatchOver() {
-        // First to 15, win by 2, cap at 21
-        if (this.scoreLeft >= this.winScore && this.scoreLeft - this.scoreRight >= 2) return true;
-        if (this.scoreRight >= this.winScore && this.scoreRight - this.scoreLeft >= 2) return true;
-        if (this.scoreLeft >= this.maxScore) return true;
-        if (this.scoreRight >= this.maxScore) return true;
+        if (this.scoreNear >= this.winScore && this.scoreNear - this.scoreFar >= 2) return true;
+        if (this.scoreFar >= this.winScore && this.scoreFar - this.scoreNear >= 2) return true;
+        if (this.scoreNear >= this.maxScore) return true;
+        if (this.scoreFar >= this.maxScore) return true;
         return false;
     }
 
@@ -181,4 +179,10 @@ export class Match {
         this.touchCount = 0;
         this.currentSide = -1;
     }
+
+    // For backward compatibility aliases
+    get scoreLeft() { return this.scoreNear; }
+    get scoreRight() { return this.scoreFar; }
+    get leftTeamName() { return this.nearTeamName; }
+    get rightTeamName() { return this.farTeamName; }
 }

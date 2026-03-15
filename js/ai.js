@@ -1,4 +1,6 @@
 // ai.js — AI controller for CPU-controlled players
+// Improved for proper volleyball flow: bump -> set -> spike
+// Works with horizontal net at COURT.NET_Y
 
 import { COURT } from './court.js';
 import { predictBallLanding, distanceBetween } from './physics.js';
@@ -6,26 +8,29 @@ import { PLAYER_STATES } from './player.js';
 
 export class AIController {
     constructor(difficulty = 1) {
-        // difficulty: 0 = easy, 1 = normal, 2 = hard
+        // difficulty: 0 = easy (exercise), 1 = normal (circuit), 2 = hard (world cup)
         this.difficulty = difficulty;
-        this.reactionDelay = [20, 10, 4][difficulty];
+        this.reactionDelay = [18, 8, 3][difficulty];
+        this.accuracy = [0.6, 0.8, 0.95][difficulty];   // how often they make good decisions
+        this.diveProbability = [0.1, 0.4, 0.8][difficulty];
         this.framesSinceBallActive = 0;
         this.targetX = 0;
         this.targetY = 0;
         this.lastDecision = { dx: 0, dy: 0, action: false, dive: false };
         this.decisionTimer = 0;
+        this.role = 'none'; // 'receiver', 'setter', 'spiker', 'blocker'
     }
 
-    update(player, ball, partner, matchState) {
+    update(player, ball, partner, matchState, touchCount) {
         const result = { dx: 0, dy: 0, action: false, dive: false };
 
-        // Can't do anything during celebration/defeat
+        // Can't act during celebration/defeat
         if (player.state === PLAYER_STATES.CELEBRATING ||
             player.state === PLAYER_STATES.DEFEATED) {
             return result;
         }
 
-        // During diving or action states, don't override
+        // Don't override active action states
         if (player.state === PLAYER_STATES.DIVING ||
             player.state === PLAYER_STATES.BUMPING ||
             player.state === PLAYER_STATES.SETTING ||
@@ -34,125 +39,208 @@ export class AIController {
             return result;
         }
 
-        // Track how long ball has been active
+        // Track ball activity
         if (ball.active) {
             this.framesSinceBallActive++;
         } else {
             this.framesSinceBallActive = 0;
         }
 
-        // Reaction delay
+        // Reaction delay (harder AI reacts faster)
         if (this.framesSinceBallActive < this.reactionDelay && ball.active) {
-            // During reaction delay, just hold position
-            return this.moveToward(player, this.getDefaultPosition(player), result);
-        }
-
-        // Decide what to do based on ball state
-        if (!ball.active && !ball.landed) {
-            // Ball not in play — go to default position
             return this.moveToward(player, this.getDefaultPosition(player), result);
         }
 
         // Serving
         if (matchState === 'READY_TO_SERVE' || matchState === 'SERVE_TOSS') {
-            if (player.state === PLAYER_STATES.IDLE || player.state === PLAYER_STATES.RUNNING) {
-                // If this player is the server
-                if (this.isServer(player)) {
-                    if (matchState === 'READY_TO_SERVE') {
-                        result.action = true;
-                    } else if (matchState === 'SERVE_TOSS') {
-                        // Wait for good timing then hit
-                        result.action = true;
-                    }
-                } else {
-                    // Partner of server — go to ready position
-                    return this.moveToward(player, this.getDefaultPosition(player), result);
-                }
-            }
-            return result;
+            return this.handleServe(player, ball, matchState, result);
         }
 
+        // Ball not in play
+        if (!ball.active && !ball.landed) {
+            return this.moveToward(player, this.getDefaultPosition(player), result);
+        }
+
+        // Ball in play
         if (ball.active) {
-            const landing = predictBallLanding(ball);
-            const isOnMySide = this.isBallOnMySide(ball, player);
-            const isComingToMe = this.isBallComingToMySide(ball, player);
-            const ballDist = distanceBetween(player, { x: ball.x, y: ball.y });
+            return this.handleBallInPlay(player, ball, partner, touchCount, result);
+        }
 
-            // Decide which player should go for the ball
-            const partnerDist = partner ? distanceBetween(partner, { x: ball.x, y: ball.y }) : Infinity;
-            const iAmCloser = ballDist <= partnerDist;
-            const partnerJustHit = partner && partner.justHitBall;
+        // Default: go to position
+        return this.moveToward(player, this.getDefaultPosition(player), result);
+    }
 
-            if ((isOnMySide || isComingToMe) && (iAmCloser || partnerJustHit)) {
-                // I should go for the ball
-                this.targetX = landing.x;
-                this.targetY = landing.y;
-
-                // Clamp target to my side
-                if (player.side === 0) {
-                    this.targetX = Math.max(COURT.LEFT, Math.min(COURT.LEFT_SIDE_MAX, this.targetX));
-                } else {
-                    this.targetX = Math.max(COURT.RIGHT_SIDE_MIN, Math.min(COURT.RIGHT, this.targetX));
-                }
-                this.targetY = Math.max(COURT.TOP, Math.min(COURT.BOTTOM - 4, this.targetY));
-
-                this.moveToward(player, { x: this.targetX, y: this.targetY }, result);
-
-                // Close enough to act?
-                const distToBall = distanceBetween(player, { x: ball.x, y: ball.y });
-
-                if (distToBall < 22) {
-                    // Determine action based on touch count and ball height
-                    const touchCount = ball.touchCount;
-
-                    if (touchCount === 0 && ball.lastTeam !== player.side) {
-                        // First touch on our side — bump
-                        result.action = true;
-                    } else if (touchCount === 1) {
-                        // Second touch — set
-                        result.action = true;
-                    } else if (touchCount >= 2) {
-                        // Third touch — spike if near net
-                        if (this.isNearNet(player)) {
-                            // Jump and spike
-                            if (player.z === 0) {
-                                result.action = true;
-                            } else {
-                                result.action = true;
-                            }
-                        } else {
-                            result.action = true;
-                        }
-                    } else {
-                        result.action = true;
-                    }
-                } else if (distToBall < 35 && distToBall > 22) {
-                    // Might need to dive
-                    if (ball.z < 15 && ball.vz < 0 && this.difficulty >= 1) {
-                        result.dive = true;
-                    }
-                }
-            } else if (isOnMySide || isComingToMe) {
-                // Partner is going for it — I should position for set/spike
-                if (ball.touchCount === 0 || (ball.touchCount === 1 && !partnerJustHit)) {
-                    // Position near net for potential spike
-                    const netPos = this.getSpikePosition(player);
-                    this.moveToward(player, netPos, result);
-                } else {
-                    // Position for coverage
-                    const coverPos = this.getCoveragePosition(player);
-                    this.moveToward(player, coverPos, result);
-                }
-            } else {
-                // Ball on opponent's side — position defensively
-                const defPos = this.getDefensivePosition(player, ball);
-                this.moveToward(player, defPos, result);
+    handleServe(player, ball, matchState, result) {
+        if (this.isServer(player)) {
+            if (matchState === 'READY_TO_SERVE') {
+                result.action = true;
+            } else if (matchState === 'SERVE_TOSS') {
+                result.action = true;
             }
         } else {
-            // Ball not active — return to default position
             this.moveToward(player, this.getDefaultPosition(player), result);
         }
+        return result;
+    }
 
+    handleBallInPlay(player, ball, partner, touchCount, result) {
+        const landing = predictBallLanding(ball);
+        const isOnMySide = this.isBallOnMySide(ball, player);
+        const isComingToMe = this.isBallComingToMySide(ball, player);
+        const ballDist = distanceBetween(player, { x: ball.x, y: ball.y });
+        const partnerDist = partner ? distanceBetween(partner, { x: ball.x, y: ball.y }) : Infinity;
+        const iAmCloser = ballDist <= partnerDist;
+        const partnerJustHit = partner && partner.justHitBall;
+        const tc = touchCount || 0;
+
+        // Determine role
+        this.determineRole(player, ball, partner, tc, isOnMySide, isComingToMe, iAmCloser, partnerJustHit);
+
+        switch (this.role) {
+            case 'receiver':
+                return this.playReceiver(player, ball, partner, landing, ballDist, tc, result);
+            case 'setter':
+                return this.playSetter(player, ball, partner, landing, ballDist, tc, result);
+            case 'spiker':
+                return this.playSpiker(player, ball, partner, landing, ballDist, tc, result);
+            case 'blocker':
+                return this.playBlocker(player, ball, landing, ballDist, result);
+            default:
+                return this.playDefense(player, ball, partner, landing, result);
+        }
+    }
+
+    determineRole(player, ball, partner, tc, isOnMySide, isComingToMe, iAmCloser, partnerJustHit) {
+        // Ball coming from opponent
+        if (!isOnMySide && isComingToMe) {
+            if (iAmCloser || partnerJustHit) {
+                this.role = 'receiver';
+            } else {
+                // Partner receives, I prepare to set or spike
+                this.role = tc === 0 ? 'setter' : 'spiker';
+            }
+            return;
+        }
+
+        // Ball on my side
+        if (isOnMySide) {
+            if (tc === 0) {
+                // First touch needed - receive
+                if (iAmCloser || partnerJustHit) {
+                    this.role = 'receiver';
+                } else {
+                    this.role = 'setter'; // prepare to set
+                }
+            } else if (tc === 1) {
+                // Need a set
+                if (!partnerJustHit && iAmCloser) {
+                    this.role = 'setter';
+                } else if (partnerJustHit) {
+                    this.role = 'setter';
+                } else {
+                    this.role = 'spiker';
+                }
+            } else if (tc >= 2) {
+                // Need a spike
+                if (iAmCloser || partnerJustHit) {
+                    this.role = 'spiker';
+                } else {
+                    this.role = 'spiker';
+                }
+            }
+            return;
+        }
+
+        // Ball on opponent side - could block or defend
+        if (ball.vy !== 0 && !isComingToMe) {
+            // Ball moving away from us - position defensively
+            this.role = 'defense';
+        } else {
+            // Ball might come our way
+            if (player.isNearNet() && ball.z > 20) {
+                this.role = 'blocker';
+            } else {
+                this.role = 'defense';
+            }
+        }
+    }
+
+    playReceiver(player, ball, partner, landing, ballDist, tc, result) {
+        // Move to where ball will land
+        const target = this.clampToMySide(player, landing.x, landing.y);
+        this.moveToward(player, target, result);
+
+        if (ballDist < 22 && player.hitCooldown === 0) {
+            result.action = true;
+            // Show ready indicator on partner
+            if (partner) partner.showIndicator('ready', 20);
+        } else if (ballDist < 35 && ball.z < 12 && ball.vz < 0) {
+            // Ball about to hit ground - dive!
+            if (Math.random() < this.diveProbability) {
+                result.dive = true;
+            }
+        }
+        return result;
+    }
+
+    playSetter(player, ball, partner, landing, ballDist, tc, result) {
+        // Position for setting (slightly forward, ready for second touch)
+        let targetX, targetY;
+        if (player.side === 0) {
+            targetX = ball.x + (partner && partner.x > COURT.WIDTH / 2 ? -15 : 15);
+            targetY = COURT.NET_Y + 15;
+        } else {
+            targetX = ball.x + (partner && partner.x > COURT.WIDTH / 2 ? -15 : 15);
+            targetY = COURT.NET_Y - 15;
+        }
+        const target = this.clampToMySide(player, targetX, targetY);
+        this.moveToward(player, target, result);
+
+        if (ballDist < 22 && player.hitCooldown === 0 && tc >= 1) {
+            result.action = true;
+        }
+        return result;
+    }
+
+    playSpiker(player, ball, partner, landing, ballDist, tc, result) {
+        // Move to net for spike position
+        const spikePos = this.getSpikePosition(player);
+        this.moveToward(player, spikePos, result);
+
+        if (ballDist < 22 && player.hitCooldown === 0) {
+            if (player.isNearNet() && tc >= 2) {
+                // Jump to spike
+                if (player.z === 0 && ball.z > 15) {
+                    result.action = true; // will jump
+                } else if (player.z > 0) {
+                    result.action = true; // in air, spike!
+                }
+            } else {
+                result.action = true;
+            }
+        } else if (ballDist < 30 && player.isNearNet() && ball.z > 20 && tc >= 2) {
+            // Close and ball is high - jump for it
+            result.action = true;
+        }
+        return result;
+    }
+
+    playBlocker(player, ball, landing, ballDist, result) {
+        // Position at net directly across from ball
+        let targetX = Math.max(COURT.LEFT + 10, Math.min(COURT.RIGHT - 10, ball.x));
+        let targetY = player.side === 0 ? COURT.NET_Y + 3 : COURT.NET_Y - 3;
+        this.moveToward(player, { x: targetX, y: targetY }, result);
+
+        // Jump to block when ball is approaching
+        if (player.isNearNet() && ball.z > 20 && ballDist < 30) {
+            result.action = true;
+        }
+        return result;
+    }
+
+    playDefense(player, ball, partner, landing, result) {
+        const defPos = this.getDefensivePosition(player, ball);
+        this.moveToward(player, defPos, result);
         return result;
     }
 
@@ -164,80 +252,76 @@ export class AIController {
         if (dist > 3) {
             result.dx = dx / dist;
             result.dy = dy / dist;
+
+            // Easy AI is slower to move
+            if (this.difficulty === 0) {
+                result.dx *= 0.7;
+                result.dy *= 0.7;
+            }
         }
         return result;
     }
 
+    clampToMySide(player, x, y) {
+        x = Math.max(COURT.LEFT + 4, Math.min(COURT.RIGHT - 14, x));
+        if (player.side === 0) {
+            y = Math.max(COURT.NET_Y + 3, Math.min(COURT.BOTTOM - 4, y));
+        } else {
+            y = Math.max(COURT.TOP + 3, Math.min(COURT.NET_Y - 3, y));
+        }
+        return { x, y };
+    }
+
     getDefaultPosition(player) {
         if (player.side === 0) {
-            if (player.playerIndex === 0) {
-                return { x: 60, y: 140 };
-            } else {
-                return { x: 80, y: 170 };
-            }
+            // Near side
+            return player.playerIndex === 0
+                ? { x: 100, y: 172 }
+                : { x: 156, y: 180 };
         } else {
-            if (player.playerIndex === 0) {
-                return { x: 196, y: 140 };
-            } else {
-                return { x: 176, y: 170 };
-            }
+            // Far side
+            return player.playerIndex === 0
+                ? { x: 110, y: 108 }
+                : { x: 160, y: 115 };
         }
     }
 
     getSpikePosition(player) {
         if (player.side === 0) {
-            return { x: COURT.NET_X - 18, y: 145 };
+            return { x: player.x, y: COURT.NET_Y + 8 };
         } else {
-            return { x: COURT.NET_X + 18, y: 145 };
-        }
-    }
-
-    getCoveragePosition(player) {
-        if (player.side === 0) {
-            return { x: 70, y: 160 };
-        } else {
-            return { x: 186, y: 160 };
+            return { x: player.x, y: COURT.NET_Y - 8 };
         }
     }
 
     getDefensivePosition(player, ball) {
-        // Position based on where ball might come
-        let targetY = Math.max(COURT.TOP + 10, Math.min(COURT.BOTTOM - 10, ball.y));
-        let targetX;
+        let targetX = Math.max(COURT.LEFT + 15, Math.min(COURT.RIGHT - 15, ball.x));
+        let targetY;
         if (player.side === 0) {
-            targetX = player.playerIndex === 0 ? 60 : 90;
+            targetY = player.playerIndex === 0 ? 170 : 185;
         } else {
-            targetX = player.playerIndex === 0 ? 196 : 166;
+            targetY = player.playerIndex === 0 ? 108 : 96;
         }
-        return { x: targetX, y: targetY };
+        return this.clampToMySide(player, targetX, targetY);
     }
 
     isBallOnMySide(ball, player) {
         if (player.side === 0) {
-            return ball.x < COURT.NET_X;
+            return ball.y > COURT.NET_Y;
         } else {
-            return ball.x >= COURT.NET_X;
+            return ball.y < COURT.NET_Y;
         }
     }
 
     isBallComingToMySide(ball, player) {
         if (player.side === 0) {
-            return ball.vx < 0;
+            return ball.vy > 0; // moving downward toward near side
         } else {
-            return ball.vx > 0;
-        }
-    }
-
-    isNearNet(player) {
-        if (player.side === 0) {
-            return player.x > COURT.NET_X - 30;
-        } else {
-            return player.x < COURT.NET_X + 30;
+            return ball.vy < 0; // moving upward toward far side
         }
     }
 
     isServer(player) {
-        // Server is typically player index 0
         return player.playerIndex === 0;
     }
 }
